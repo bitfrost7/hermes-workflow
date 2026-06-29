@@ -241,6 +241,10 @@ def _process_kanban(
         items = _eval_jinja_expr(step.for_each, render_vars)
         if not isinstance(items, list):
             items = [items]
+        if verbose:
+            print(f"     for_each='{step.for_each}' → {type(items).__name__}[{len(items)}]")
+            if items and isinstance(items[0], dict):
+                print(f"     first item keys: {list(items[0].keys())}")
     else:
         items = [None]
 
