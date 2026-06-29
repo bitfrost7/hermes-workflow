@@ -108,6 +108,9 @@ def compile_workflow(
             raise
 
     set_pipeline_step(pipeline_id, wf.steps[0].id if wf.steps else None)
+    # Strip _goto before persisting — it was consumed during compilation's
+    # on_exit branching and should not trigger again in the runner.
+    step_outputs.pop("_goto", None)
     update_step_outputs(pipeline_id, step_outputs)
     return pipeline_id, all_cards
 
