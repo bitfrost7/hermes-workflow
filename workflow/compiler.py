@@ -238,7 +238,11 @@ def _process_kanban(
 
     # Resolve iteration items
     if step.for_each:
-        items = _eval_jinja_expr(step.for_each, render_vars)
+        # Strip {{ }} wrapper if present (stored from YAML with braces)
+        expr = step.for_each.strip()
+        if expr.startswith("{{") and expr.endswith("}}"):
+            expr = expr[2:-2].strip()
+        items = _eval_jinja_expr(expr, render_vars)
         if not isinstance(items, list):
             items = [items]
         if verbose:
