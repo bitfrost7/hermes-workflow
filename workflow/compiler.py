@@ -48,7 +48,7 @@ def compile_workflow(
     Returns (pipeline_id: str, created_cards: list[dict]).
     Each created card dict has: {step_id, card_id, title, assignee, status}
     """
-    from .state import create_pipeline_instance, set_pipeline_step
+    from .state import create_pipeline_instance, set_pipeline_step, update_step_outputs
 
     # Resolve vars: defaults from YAML + user overrides
     resolved_vars: dict = {**wf.vars, **{k: v for k, v in user_vars.items()}}
@@ -79,6 +79,7 @@ def compile_workflow(
         )
 
     set_pipeline_step(pipeline_id, wf.steps[0].id if wf.steps else None)
+    update_step_outputs(pipeline_id, step_outputs)
     return pipeline_id, all_cards
 
 

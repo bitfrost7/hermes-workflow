@@ -67,9 +67,13 @@ def run_pipeline(
         return 0
 
     # Main execution loop — walks through steps, advancing on completion
-    from .state import set_pipeline_step, set_pipeline_cycle
+    from .state import set_pipeline_step, set_pipeline_cycle, update_step_outputs, get_pipeline
 
     while current_step:
+        # Reload step outputs from state (scripts run during compilation)
+        pipe = get_pipeline(pipeline_id)
+        if pipe:
+            step_outputs.update(pipe.step_outputs)
         set_pipeline_step(pipeline_id, current_step.id)
         print(f"\n── Step: {current_step.id} ──")
 

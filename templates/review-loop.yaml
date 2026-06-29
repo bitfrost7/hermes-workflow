@@ -5,7 +5,12 @@
 # and potentially revised through multiple cycles.
 #
 # Usage:
-#   hermes workflow run --template review-loop --var service=apisvr
+#   hermes workflow run --template review-loop \
+#     --var SERVICE=apisvr \
+#     --var VAULT=~/Documents/Code/work/mywiki
+#
+# The pipeline uses {{ SERVICE }} and {{ VAULT }} variables.
+# Pass them via --var SERVICE=xxx --var VAULT=/path
 
 meta:
   name: review-loop
@@ -13,8 +18,8 @@ meta:
   description: "Writer → Reviewer → Fix → Re-review pipeline with up to 10 fix cycles"
 
 vars:
-  VAULT: "{{ .VAULT }}"
-  SERVICE: "{{ .service }}"
+  SERVICE: ""
+  VAULT: ""
 
 steps:
 
@@ -49,6 +54,7 @@ steps:
     type: script
     depends_on: [reviewer]
     script: "{{ VAULT }}/bin/discuss verify {{ VAULT }}/raw/assets/privatelink/{{ SERVICE }}/discuss"
+    output: verify_result
     on_exit:
       0:
         goto: done
