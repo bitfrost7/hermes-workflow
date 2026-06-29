@@ -33,6 +33,10 @@ from .workflow.state import (
     list_pipelines,
     set_pipeline_status,
     delete_old_pipelines,
+    get_step_logs,
+    get_step_log,
+    get_worker_log,
+    get_log_by_id,
 )
 from .workflow.schema import PipelineStatus
 from .workflow.graph import WorkflowGraph
@@ -68,6 +72,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     p_run.add_argument("--board", default=None, help="Kanban board slug")
     p_run.add_argument("--poll-interval", type=int, default=15, help="Poll interval (seconds)")
     p_run.add_argument("--dry-run", action="store_true", help="Validate only — no cards created, no execution")
+    p_run.add_argument("--verbose", "-v", action="store_true", help="Detailed per-step debug output")
 
     # check
     p_check = subs.add_parser(
@@ -128,6 +133,44 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     )
     p_gc.add_argument("--older-than", type=int, default=7, help="Delete instances older than N days")
 
+    # logs — list step execution logs for a pipeline
+    p_logs = subs.add_parser(
+        "logs",
+        help="Show step execution logs for a completed pipeline",
+        description=textwrap.dedent("""\
+            Show all step execution logs for a pipeline. Each row shows
+            one step's status, duration, exit code, and card count.
+
+            Use `hermes workflow log <pipeline_id> <step_id>` for
+            detailed info including worker agent logs.
+        """),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_logs.add_argument("pipeline_id", help="Pipeline ID (pipe_...)")
+
+    # log — detailed step log with worker agent output
+    p_log = subs.add_parser(
+        "log",
+        help="Show detailed execution log for one step (with profile agent output)",
+        description=textwrap.dedent("""\
+            Show the detailed execution log for a specific step within
+            a pipeline. Includes script stdout/stderr, kanban card details,
+            and profile agent worker logs (via `hermes kanban runs`).
+
+            Use --card to target a specific kanban card's worker log.
+            Use --tail to show the last N bytes of the worker log.
+        """),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_log.add_argument("pipeline_id", help="Pipeline ID (pipe_...)")
+    p_log.add_argument("step_id", help="Step id within the pipeline")
+    p_log.add_argument("--cycle", type=int, default=0,
+                       help="Loop cycle (default: most recent)")
+    p_log.add_argument("--card", default=None,
+                       help="Show worker log for a specific kanban card")
+    p_log.add_argument("--tail", type=int, default=0,
+                       help="Show last N chars of worker log (0 = all)")
+
     # templates
     subs.add_parser(
         "templates",
@@ -180,6 +223,10 @@ def dispatch(args: argparse.Namespace) -> int:
             return _cmd_cancel(args)
         elif cmd == "gc":
             return _cmd_gc(args)
+        elif cmd == "logs":
+            return _cmd_logs(args)
+        elif cmd == "log":
+            return _cmd_log(args)
         elif cmd == "templates":
             return _cmd_templates()
         elif cmd == "template":
@@ -272,6 +319,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             wf=wf,
             user_vars=user_vars,
             board=args.board,
+            verbose=args.verbose,
         )
     except Exception as e:
         print(f"Compilation failed: {e}", file=sys.stderr)
@@ -285,6 +333,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         pipeline_id=pipeline_id,
         board=args.board,
         poll_interval=args.poll_interval,
+        verbose=args.verbose,
     )
 
     return rc
@@ -429,6 +478,136 @@ def _cmd_cancel(args: argparse.Namespace) -> int:
 def _cmd_gc(args: argparse.Namespace) -> int:
     deleted = delete_old_pipelines(older_than_days=args.older_than)
     print(f"Deleted {deleted} pipeline(s) older than {args.older_than} days.")
+    return 0
+
+
+def _cmd_logs(args: argparse.Namespace) -> int:
+    """Show all step execution logs for a pipeline."""
+    logs = get_step_logs(args.pipeline_id)
+    if not logs:
+        print(f"No step logs found for pipeline: {args.pipeline_id}")
+        print("  (pipeline may not have been run yet)")
+        return 1
+
+    print(f"Step logs for: {args.pipeline_id}")
+    print()
+    print(f"{'STEP':<20} {'TYPE':<10} {'STATUS':<12} {'DURATION':<12} {'EXIT':<6} {'CARDS':<8}")
+    print("-" * 68)
+    for log in logs:
+        duration = ""
+        if log["started_at"] and log["ended_at"]:
+            d = log["ended_at"] - log["started_at"]
+            duration = f"{d}s" if d < 60 else f"{d // 60}m{d % 60}s"
+        exit_code = str(log["exit_code"]) if log["exit_code"] is not None else "-"
+        card_count = len(log["card_ids"])
+        worker_count = len(log["worker_logs"])
+        cards_str = f"{card_count} (+{worker_count}w)" if worker_count else str(card_count)
+
+        step_label = log["step_id"]
+        if log.get("cycle", 1) > 1:
+            step_label += f" (c{log['cycle']})"
+
+        print(f"{step_label:<20} {log['step_type']:<10} {log['status']:<12} {duration:<12} {exit_code:<6} {cards_str:<8}")
+
+    print()
+    print(f"Total: {len(logs)} step log(s)")
+    print(f"Use `hermes workflow log <pipeline_id> <step_id>` for detail.")
+    return 0
+
+
+def _cmd_log(args: argparse.Namespace) -> int:
+    """Show detailed execution log for one step."""
+    cycle = args.cycle or 0  # 0 = most recent
+
+    if args.card:
+        # Show worker log for a specific card
+        worker = get_worker_log(args.pipeline_id, args.step_id, args.card, cycle)
+        if worker is None:
+            print(f"No worker log for card '{args.card}' in step '{args.step_id}'")
+            return 1
+
+        print(f"Worker log for card: {args.card}")
+        print(f"  Profile:       {worker.get('profile', '?')}")
+        print(f"  Status:        {worker.get('status', '?')}")
+        print(f"  Outcome:       {worker.get('outcome', '?')}")
+        print(f"  Elapsed:       {worker.get('elapsed_seconds', '?')}s")
+        if worker.get("summary"):
+            print(f"  Summary:       {worker['summary']}")
+        print()
+
+        log_text = worker.get("log_preview") or "(no worker log available)"
+        if args.tail > 0:
+            log_text = log_text[-args.tail:]
+        elif len(log_text) > 2000:
+            log_text = log_text[:1000] + "\n  ... (truncated) ...\n" + log_text[-1000:]
+
+        print("── Worker Log ──")
+        print(log_text)
+        if worker.get("log_length", 0) > 5000:
+            hidden = worker["log_length"] - 5000
+            print(f"\n  ... ({hidden} more bytes — use --tail to see more) ...")
+        if worker.get("error"):
+            print(f"\n  ⚠️  Fetch error: {worker['error']}")
+        return 0
+
+    # Show full step detail
+    log = get_step_log(args.pipeline_id, args.step_id, cycle)
+    if log is None:
+        print(f"No log found for step '{args.step_id}' in pipeline '{args.pipeline_id}'")
+        return 1
+
+    print(f"Step:          {log['step_id']}")
+    print(f"Type:          {log['step_type']}")
+    print(f"Status:        {log['status']}")
+    print(f"Cycle:         {log['cycle']}")
+    duration = ""
+    if log["started_at"] and log["ended_at"]:
+        d = log["ended_at"] - log["started_at"]
+        duration = f"{d}s" if d < 60 else f"{d // 60}m{d % 60}s"
+        print(f"Duration:      {duration}")
+    print(f"Exit code:     {log['exit_code'] or '-'}")
+    print(f"Cards:         {len(log['card_ids'])}")
+    print(f"Worker logs:   {len(log['worker_logs'])}")
+
+    if log.get("error_message"):
+        print(f"Error:         {log['error_message']}")
+
+    if log.get("details"):
+        print(f"Details:       {json.dumps(log['details'])}")
+
+    # Print script stdout/stderr
+    if log["stdout"]:
+        print()
+        print("── Script stdout ──")
+        print(log["stdout"][:2000])
+        if len(log["stdout"]) > 2000:
+            print("  ... (truncated) ...")
+    if log["stderr"]:
+        print()
+        print("── Script stderr ──")
+        print(log["stderr"][:2000])
+        if len(log["stderr"]) > 2000:
+            print("  ... (truncated) ...")
+
+    # Print worker logs summary
+    if log["worker_logs"]:
+        print()
+        print("── Worker Runs ──")
+        for w in log["worker_logs"]:
+            profile = w.get("profile", "?")
+            outcome = w.get("outcome", "?")
+            elapsed = w.get("elapsed_seconds", "?")
+            summary = w.get("summary", "")
+            print(f"  {w.get('card_id', '?'):<20} profile={profile:<12} outcome={outcome:<12} "
+                  f"elapsed={elapsed}s")
+            if summary:
+                print(f"    summary: {summary[:200]}")
+        print()
+        print("  Use `hermes workflow log <pipeline_id> <step_id> --card <id>` for full log.")
+
+    print()
+    print("  Card IDs:", ", ".join(log["card_ids"]) if log["card_ids"] else "(none)")
+
     return 0
 
 

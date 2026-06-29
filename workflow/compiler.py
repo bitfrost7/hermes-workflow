@@ -7,6 +7,7 @@ The compiler:
   3. Computes parent-child dependencies across steps
   4. Creates kanban cards with hermes kanban create --parent
   5. Sets workflow_template_id and current_step_key on each card
+  6. Records step execution logs in the state DB for debugging
 
 Pipeline execution is handled by runner.py; this module only creates the cards.
 """
@@ -42,13 +43,20 @@ def compile_workflow(
     wf: WorkflowDef,
     user_vars: Dict[str, str],
     board: Optional[str] = None,
+    verbose: bool = False,
 ) -> tuple[str, list[dict]]:
     """Compile a WorkflowDef into kanban cards.
 
     Returns (pipeline_id: str, created_cards: list[dict]).
     Each created card dict has: {step_id, card_id, title, assignee, status}
     """
-    from .state import create_pipeline_instance, set_pipeline_step, update_step_outputs
+    from .state import (
+        create_pipeline_instance,
+        set_pipeline_step,
+        update_step_outputs,
+        start_step_log,
+        complete_step_log,
+    )
 
     # Resolve vars: defaults from YAML + user overrides
     resolved_vars: dict = {**wf.vars, **{k: v for k, v in user_vars.items()}}
@@ -67,16 +75,37 @@ def compile_workflow(
     # Walk steps in order
     for step in wf.steps:
         _render_step_vars(step, resolved_vars, step_outputs)
-        _process_step(
-            step=step,
-            wf=wf,
+
+        # Start step log
+        log_id = start_step_log(
             pipeline_id=pipeline_id,
-            resolved_vars=resolved_vars,
-            step_outputs=step_outputs,
-            created_card_map=created_card_map,
-            all_cards=all_cards,
-            board=board,
+            step_id=step.id,
+            step_type=step.type.value if hasattr(step, "type") else "unknown",
+            cycle=1,
+            details={"depends_on": step.depends_on},
         )
+
+        try:
+            _process_step(
+                step=step,
+                wf=wf,
+                pipeline_id=pipeline_id,
+                resolved_vars=resolved_vars,
+                step_outputs=step_outputs,
+                created_card_map=created_card_map,
+                all_cards=all_cards,
+                board=board,
+                log_id=log_id,
+                verbose=verbose,
+            )
+            # Mark step log as done (for kanban/noop, they complete instantly)
+            complete_step_log(log_id, status="done")
+        except Exception as e:
+            complete_step_log(
+                log_id, status="error",
+                error_message=f"{type(e).__name__}: {e}",
+            )
+            raise
 
     set_pipeline_step(pipeline_id, wf.steps[0].id if wf.steps else None)
     update_step_outputs(pipeline_id, step_outputs)
@@ -92,23 +121,26 @@ def _process_step(
     created_card_map: dict[str, list[str]],
     all_cards: list[dict],
     board: Optional[str],
+    log_id: int,
+    verbose: bool = False,
 ) -> None:
     """Process a single step — script, kanban, loop, or noop."""
 
     if isinstance(step, ScriptStep):
-        _process_script(step, resolved_vars, step_outputs)
+        _process_script(step, resolved_vars, step_outputs, log_id, verbose)
 
     elif isinstance(step, KanbanStep):
         _process_kanban(
             step, pipeline_id, resolved_vars,
             created_card_map, all_cards, wf.meta.name, board,
+            log_id, verbose,
         )
 
     elif isinstance(step, LoopStep):
         _process_loop(
             step, wf, pipeline_id, resolved_vars,
             step_outputs, created_card_map, all_cards,
-            board,
+            board, log_id, verbose,
         )
 
     # NoopStep — nothing to do
@@ -118,6 +150,8 @@ def _process_script(
     step: ScriptStep,
     vars: dict,
     step_outputs: dict,
+    log_id: int,
+    verbose: bool = False,
 ) -> None:
     """Execute a script step and capture its output."""
     import time
@@ -134,25 +168,35 @@ def _process_script(
     step_outputs[f"{step.id}.exit_code"] = result.returncode
 
     # Store stdout if output variable is set
-    if step.output:
-        stdout = result.stdout.strip()
-        if stdout:
-            try:
-                step_outputs[step.output] = json.loads(stdout)
-            except (json.JSONDecodeError, ValueError):
-                step_outputs[step.output] = stdout
+    script_stdout = result.stdout.strip()
+    if step.output and script_stdout:
+        try:
+            step_outputs[step.output] = json.loads(script_stdout)
+        except (json.JSONDecodeError, ValueError):
+            step_outputs[step.output] = script_stdout
 
     # Handle exit code branches
+    goto_target = None
     if step.on_exit and result.returncode != 0:
         branch = step.on_exit.get(str(result.returncode)) or step.on_exit.get("else")
         if branch:
             step_outputs["_goto"] = branch.goto
+            goto_target = branch.goto
             print(f"     → exit={result.returncode}, jump to '{branch.goto}'")
 
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        if stderr:
-            print(f"     ⚠️  stderr: {stderr[:200]}")
+    stderr = result.stderr.strip()
+    if stderr:
+        print(f"     ⚠️  stderr: {stderr[:200]}")
+
+    # Write step log
+    from .state import complete_step_log
+    complete_step_log(
+        log_id,
+        status="done" if result.returncode == 0 else "error",
+        exit_code=result.returncode,
+        stdout=script_stdout,
+        stderr=stderr,
+    )
 
 
 def _process_kanban(
@@ -163,6 +207,8 @@ def _process_kanban(
     all_cards: list[dict],
     template_name: str,
     board: Optional[str],
+    log_id: int,
+    verbose: bool = False,
 ) -> None:
     """Create kanban cards for a kanban step (with optional for_each fan-out)."""
 
@@ -174,8 +220,9 @@ def _process_kanban(
     else:
         items = [None]
 
+    created_card_ids: list[str] = []
+
     for item in items:
-        # Render template with item context
         item_vars = {**vars, "item": item}
         title = _render_str(step.template.title, item_vars)
         assignee = _render_str(step.template.assignee, item_vars)
@@ -205,11 +252,16 @@ def _process_kanban(
         if board:
             cmd = ["--board", board] + cmd
 
+        # Log the command being run
+        if verbose:
+            print(f"     $ {' '.join(cmd)}")
+
         # Execute
         result = _run_hermes(cmd)
         card_id = result.get("id", "?")
         step.card_ids.append(card_id)
         created_card_map.setdefault(step.id, []).append(card_id)
+        created_card_ids.append(card_id)
         all_cards.append({
             "step_id": step.id,
             "card_id": card_id,
@@ -222,7 +274,19 @@ def _process_kanban(
         _tag_card(card_id, template_name, step.id, board)
 
         item_repr = f" [{item}]" if item else ""
-        print(f"  📋 {step.id}{item_repr}: {title} → {card_id}")
+        print(f"  📋 {step.id}{item_repr}: {title} → {card_id} (→ {assignee})")
+
+        # Log created card info
+        if verbose:
+            print(f"       skill={skill}, workspace={workspace}, parents={parent_ids}")
+
+    # Write step log
+    from .state import complete_step_log
+    complete_step_log(
+        log_id,
+        status="done",
+        card_ids=created_card_ids,
+    )
 
 
 def _tag_card(card_id: str, template_name: str, step_key: str, board: Optional[str]) -> None:
@@ -236,9 +300,6 @@ def _tag_card(card_id: str, template_name: str, step_key: str, board: Optional[s
     For direct DB access in the future, this would use:
       UPDATE tasks SET workflow_template_id=?, current_step_key=? WHERE id=?
     """
-    # Workaround: add a structured comment the watcher can parse.
-    # In v2 when the dispatcher consumes these columns we'll write them
-    # via the kanban_db Python API directly.
     marker = json.dumps({
         "_wf_template": template_name,
         "_wf_step": step_key,
@@ -255,9 +316,11 @@ def _process_loop(
     created_card_map: dict,
     all_cards: list[dict],
     board: Optional[str],
+    parent_log_id: int,
+    verbose: bool = False,
 ) -> None:
     """Process a loop step — iterates sub-steps."""
-    from .state import set_pipeline_cycle
+    from .state import set_pipeline_cycle, start_step_log, complete_step_log
 
     for cycle in range(1, step.max_iterations + 1):
         set_pipeline_cycle(pipeline_id, cycle)
@@ -267,19 +330,47 @@ def _process_loop(
 
         # Clear previous loop card maps so sub-steps create fresh cards
         loop_card_map: dict[str, list[str]] = {}
+        cycle_card_ids: list[str] = []
 
         for sub in step.steps:
             _render_step_vars(sub, cycle_vars, step_outputs)
-            _process_step(
-                step=sub,
-                wf=wf,
+
+            # Start log for sub-step (inside loop)
+            sub_log_id = start_step_log(
                 pipeline_id=pipeline_id,
-                resolved_vars=cycle_vars,
-                step_outputs=step_outputs,
-                created_card_map=loop_card_map,
-                all_cards=all_cards,
-                board=board,
+                step_id=sub.id,
+                step_type=sub.type.value if hasattr(sub, "type") else "unknown",
+                cycle=cycle,
+                details={
+                    "depends_on": sub.depends_on,
+                    "parent_loop": step.id,
+                },
             )
+
+            try:
+                _process_step(
+                    step=sub,
+                    wf=wf,
+                    pipeline_id=pipeline_id,
+                    resolved_vars=cycle_vars,
+                    step_outputs=step_outputs,
+                    created_card_map=loop_card_map,
+                    all_cards=all_cards,
+                    board=board,
+                    log_id=sub_log_id,
+                    verbose=verbose,
+                )
+                complete_step_log(sub_log_id, status="done")
+            except Exception as e:
+                complete_step_log(
+                    sub_log_id, status="error",
+                    error_message=f"{type(e).__name__}: {e}",
+                )
+                raise
+
+            # Collect card ids from sub-step
+            if sub.id in loop_card_map:
+                cycle_card_ids.extend(loop_card_map[sub.id])
 
         # Check while condition
         if step.while_condition:
