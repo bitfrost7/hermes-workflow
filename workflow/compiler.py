@@ -159,7 +159,10 @@ def _process_script(
     """Execute a script step and capture its output."""
     import time
 
-    rendered = _render_str(step.script, vars)
+    # Merge step_outputs into vars for script template resolution.
+    # This allows {{ l1_json }} from a prior step's output to be used.
+    render_vars = {**vars, **step_outputs}
+    rendered = _render_str(step.script, render_vars)
     print(f"  ⚡ {step.id}: {rendered[:120]}")
 
     result = subprocess.run(
