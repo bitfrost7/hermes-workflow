@@ -10,6 +10,8 @@ from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
+from pydantic import field_validator
+from typing_extensions import Annotated
 
 
 class StepType(str, Enum):
@@ -42,12 +44,20 @@ class BaseStep(BaseModel):
 class ScriptStep(BaseStep):
     """A deterministic script step — runs a shell command, not a kanban card."""
 
-    type: Literal[StepType.SCRIPT] = Field(default=StepType.SCRIPT)
+    type: Literal[StepType.SCRIPT] = StepType.SCRIPT
     script: str = Field(description="Shell command to run")
     on_exit: Optional[Dict[str, OnExitBranch]] = Field(
         default=None,
-        description="Exit code → jump target mapping, e.g. {0: {goto: next}, else: {goto: fix}}",
+        description="Exit code → jump target mapping",
     )
+
+    # Accept integer keys from YAML (0, 1, etc.) and convert to strings
+    @field_validator("on_exit", mode="before")
+    @classmethod
+    def _coerce_on_exit_keys(cls, v):
+        if v is None:
+            return v
+        return {str(k): val for k, val in v.items()}
 
 
 class KanbanCardTemplate(BaseModel):
@@ -63,7 +73,7 @@ class KanbanCardTemplate(BaseModel):
 class KanbanStep(BaseStep):
     """A kanban card step — creates one or more kanban task cards."""
 
-    type: Literal[StepType.KANBAN] = Field(default=StepType.KANBAN)
+    type: Literal[StepType.KANBAN] = StepType.KANBAN
     for_each: Optional[str] = Field(
         default=None,
         description="Jinja2 expression to iterate over (e.g. 'l1_json.actions')",
@@ -77,26 +87,36 @@ class KanbanStep(BaseStep):
 class LoopStep(BaseStep):
     """A loop step — repeats a block of sub-steps until a condition is met."""
 
-    type: Literal[StepType.LOOP] = Field(default=StepType.LOOP)
+    type: Literal[StepType.LOOP] = StepType.LOOP
     max_iterations: int = Field(default=10, ge=1, description="Max loop iterations")
     while_condition: Optional[str] = Field(
         default=None,
         alias="while",
         description="Jinja2 condition string; empty/null = infinite until on_exit breaks",
     )
-    steps: List[Union["ScriptStep", "KanbanStep", "LoopStep", "NoopStep"]] = Field(
-        description="Sub-steps to repeat each iteration"
+    steps: List[Annotated[Union["ScriptStep", "KanbanStep", "LoopStep", "NoopStep"], Field(discriminator="type")]] = Field(
+        min_length=1,
+        description="Sub-steps to repeat each iteration",
     )
 
 
 class NoopStep(BaseStep):
     """A no-op step — terminal marker with no action."""
 
-    type: Literal[StepType.NOOP] = Field(default=StepType.NOOP)
+    type: Literal[StepType.NOOP] = StepType.NOOP
     summary: Optional[str] = Field(default=None, description="Completion message")
 
 
-StepDef = Union[ScriptStep, KanbanStep, LoopStep, NoopStep]
+# Resolve forward refs for recursive LoopStep
+ScriptStep.model_rebuild()
+KanbanStep.model_rebuild()
+LoopStep.model_rebuild()
+NoopStep.model_rebuild()
+
+StepDef = Annotated[
+    Union[ScriptStep, KanbanStep, LoopStep, NoopStep],
+    Field(discriminator="type"),
+]
 
 
 class WorkflowMeta(BaseModel):
@@ -123,6 +143,12 @@ class WorkflowDef(BaseModel):
     vars: Dict[str, str] = Field(default_factory=dict, description="Template variables")
     steps: List[StepDef] = Field(min_length=1, description="Ordered step definitions")
     settings: WorkflowSettings = Field(default_factory=WorkflowSettings)
+
+    @field_validator("steps", mode="wrap")
+    @classmethod
+    def _validate_steps_discriminated(cls, v, handler):
+        """Ensure steps list uses discriminated union correctly."""
+        return handler(v)
 
 
 class PipelineStatus(str, Enum):
