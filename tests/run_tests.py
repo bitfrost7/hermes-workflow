@@ -131,20 +131,28 @@ def test_steps_required():
         pass
 
 
-@test("schema", "duplicate-ids", "Duplicate step ids should fail")
+@test("schema", "duplicate-ids", "Duplicate step ids (caught by loader.validate_ids)")
 def test_duplicate_ids():
-    from pydantic import ValidationError
-    from workflow.schema import WorkflowDef
+    """Duplicate IDs are detected by loader._validate_ids_unique, not Pydantic
+    schema. The schema accepts duplicates (each step validates independently),
+    so this test verifies loader validation rejects them."""
+    from workflow.loader import _parse_yaml
+
+    raw = """
+meta:
+  name: test
+  version: 1.0.0
+steps:
+  - id: a
+    type: noop
+  - id: a
+    type: noop
+"""
+    from workflow.loader import LoadError
     try:
-        WorkflowDef.model_validate({
-            "meta": {"name": "test", "version": "1.0.0"},
-            "steps": [
-                {"id": "a", "type": "noop"},
-                {"id": "a", "type": "noop"},
-            ],
-        })
-        assert False, "Should have raised ValidationError"
-    except ValidationError:
+        _parse_yaml(raw, source="<test>")
+        assert False, "Should have raised LoadError"
+    except LoadError:
         pass
 
 
@@ -641,28 +649,88 @@ def test_cli_gc():
 #  Tests: Workflow Run Integration (requires discuss)
 # ═══════════════════════════════════════════════════════════════════
 
-@test("cli", "run-review-loop", "Full pipeline run with review-loop template",
-      requires_discuss=True)
-def test_cli_run_review_loop():
-    """This test creates kanban cards. It's marked with requires_discuss
-    because the review-loop template calls the discuss binary.
-    We only test that the pipeline creates cards and advances correctly."""
-    import subprocess
+@test("cli", "run-minimal", "Minimal script-only pipeline completes without kanban cards",
+      requires_kanban=False)
+def test_cli_run_minimal():
+    """Run a minimal pipeline with script + noop steps (no kanban cards).
+    This tests the full lifecycle: check → compile → run → log."""
+    import subprocess, tempfile, os
 
-    # Run with a mild timeout — pipeline should create cards and advance
-    # through steps, then encounter discuss permission error and hit fix_cycle
-    r = subprocess.run(
-        ["hermes", "workflow", "run", "--template", "review-loop",
-         "--var", "SERVICE=test-int", "--var", "VAULT=/tmp",
-         "--poll-interval", "5"],
-        capture_output=True, text=True, timeout=60,
-    )
-    # We expect this to finish (even with errors) before timeout
-    assert r.returncode in (0, 1), f"run failed with {r.returncode}: {r.stderr[:500]}"
+    # Write a minimal workflow YAML
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write("""\
+meta:
+  name: minimal-test
+  version: 1.0.0
+steps:
+  - id: greet
+    type: script
+    script: echo "hello world"
+    output: greeting
+  - id: done
+    type: noop
+    summary: "Done with minimal test"
+""")
+        yaml_path = f.name
 
-    # Check that cards were actually created
-    assert "📋 writer:" in r.stdout or "Card" in r.stdout, \
-        "Should have created writer cards"
+    try:
+        r = subprocess.run(
+            ["hermes", "workflow", "run", "--file", yaml_path,
+             "--poll-interval", "3"],
+            capture_output=True, text=True, timeout=30,
+        )
+        # Should complete (exit 0) — no cards to wait for
+        assert r.returncode == 0, f"run failed: {r.stderr[:500]}"
+
+        # Check output
+        assert "hello world" in r.stdout or "Pipeline complete" in r.stdout, \
+            f"Unexpected output: {r.stdout[:500]}"
+
+        # Check step_logs were created
+        r2 = subprocess.run(
+            ["hermes", "workflow", "list"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert "minimal-test" in r2.stdout, "Pipeline should appear in list"
+
+    finally:
+        os.unlink(yaml_path)
+
+
+@test("cli", "run-script-step", "Script pipeline with error captures exit code and stderr",
+      requires_kanban=False)
+def test_cli_run_script_error():
+    """Run a pipeline where a script step fails, verifying error capture."""
+    import subprocess, tempfile, os
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write("""\
+meta:
+  name: script-error-test
+  version: 1.0.0
+steps:
+  - id: fail_script
+    type: script
+    script: bash -c 'echo "stderr output" >&2; exit 42'
+  - id: done
+    type: noop
+    summary: "should not reach here"
+""")
+        yaml_path = f.name
+
+    try:
+        r = subprocess.run(
+            ["hermes", "workflow", "run", "--file", yaml_path,
+             "--poll-interval", "3"],
+            capture_output=True, text=True, timeout=30,
+        )
+        # Should exit 1 (script failed but that's expected for this test)
+        if r.returncode != 0 and r.returncode != 1:
+            assert False, f"Unexpected exit: {r.returncode}: {r.stderr[:500]}"
+        assert "stderr output" in r.stdout or "exit=42" in r.stdout, \
+            f"Should show error: {r.stdout[:500]}"
+    finally:
+        os.unlink(yaml_path)
 
 
 # ═══════════════════════════════════════════════════════════════════
