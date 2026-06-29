@@ -9,6 +9,7 @@ Subcommands:
     show         Show a pipeline instance with its step and card status
     cancel       Cancel a running pipeline and archive its cards
     gc           Clean up old pipeline instances
+    check        Validate a workflow YAML for logical errors (graph analysis)
     templates    List available built-in workflow templates
     template     Show a template's content
 """
@@ -20,6 +21,7 @@ import json
 import os
 import sys
 import textwrap
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +35,8 @@ from .workflow.state import (
     delete_old_pipelines,
 )
 from .workflow.schema import PipelineStatus
+from .workflow.graph import WorkflowGraph
+from .workflow.validate import validate as run_validation
 
 # ---------------------------------------------------------------------------
 # argparse wiring
@@ -53,6 +57,7 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
               --template <name>  Built-in template name
 
             Pass variables with --var key=val (repeatable).
+            Use --dry-run to validate without creating any cards or running.
         """),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -62,6 +67,38 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     p_run.add_argument("--var", action="append", default=[], help="Variable: key=val")
     p_run.add_argument("--board", default=None, help="Kanban board slug")
     p_run.add_argument("--poll-interval", type=int, default=15, help="Poll interval (seconds)")
+    p_run.add_argument("--dry-run", action="store_true", help="Validate only — no cards created, no execution")
+
+    # check
+    p_check = subs.add_parser(
+        "check",
+        help="Validate a workflow YAML for logical errors (graph analysis)",
+        description=textwrap.dedent("""\
+            Run comprehensive validation on a workflow YAML:
+
+              Graph analysis:
+                - Circular dependency detection
+                - Control-flow cycle detection
+                - Orphan/unreachable step detection
+                - Dead loop detection (no exit path)
+
+              Schema checks:
+                - Duplicate step ids
+                - Missing depends_on / goto targets
+                - Unused variables
+                - Unbounded loops
+
+              Semantic checks:
+                - Kanban steps without assignee/title
+                - Noop-only workflows
+
+            Exits with code 0 only when no errors are found.
+        """),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_check.add_argument("--url", default=None, help="URL to workflow YAML")
+    p_check.add_argument("--file", default=None, help="Local workflow YAML file")
+    p_check.add_argument("--template", default=None, help="Built-in template name")
 
     # list
     subs.add_parser(
@@ -105,7 +142,6 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     p_tmpl.add_argument("action", choices=["show"], help="Sub-action")
     p_tmpl.add_argument("name", help="Template name")
 
-    # version
     parser.set_defaults(func=dispatch)
 
 
@@ -120,6 +156,7 @@ def dispatch(args: argparse.Namespace) -> int:
         print()
         print("Commands:")
         print("  run            Run a pipeline from a YAML definition")
+        print("  check          Validate a workflow YAML (graph analysis)")
         print("  list           List pipeline instances")
         print("  show           Show a pipeline instance")
         print("  cancel         Cancel a running pipeline")
@@ -133,6 +170,8 @@ def dispatch(args: argparse.Namespace) -> int:
     try:
         if cmd == "run":
             return _cmd_run(args)
+        elif cmd == "check":
+            return _cmd_check(args)
         elif cmd == "list":
             return _cmd_list(args)
         elif cmd == "show":
@@ -154,26 +193,19 @@ def dispatch(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Subcommand handlers
+# Shared: resolve source + load workflow
 # ---------------------------------------------------------------------------
 
-def _cmd_run(args: argparse.Namespace) -> int:
-    # Resolve source
+def _load_workflow(args) -> tuple:
+    """Load a WorkflowDef from args.url / args.file / args.template.
+
+    Returns (wf, source_label) or exits on error.
+    """
     source = args.url or args.file or args.template
     if not source:
         print("Error: specify one of --url, --file, or --template", file=sys.stderr)
-        return 1
+        return None, None
 
-    # Parse --var key=val
-    user_vars = {}
-    for v in args.var:
-        if "=" not in v:
-            print(f"Error: --var must be key=val, got: {v}", file=sys.stderr)
-            return 1
-        key, _, val = v.partition("=")
-        user_vars[key.strip()] = val.strip()
-
-    # Load workflow
     try:
         if args.url:
             wf = loader.load_from_url(args.url)
@@ -183,15 +215,58 @@ def _cmd_run(args: argparse.Namespace) -> int:
             wf = loader.load_from_template(args.template)
     except loader.LoadError as e:
         print(f"Error: {e}", file=sys.stderr)
+        return None, None
+
+    return wf, source
+
+
+# ---------------------------------------------------------------------------
+# Subcommand handlers
+# ---------------------------------------------------------------------------
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    wf, source = _load_workflow(args)
+    if wf is None:
         return 1
 
-    # Compile
+    user_vars = _parse_vars(args.var)
+
+    # Print workflow info
     print(f"Workflow: {wf.meta.name} v{wf.meta.version}")
     print(f"Steps: {len(wf.steps)}")
     if wf.meta.description:
         print(f"Description: {wf.meta.description}")
+
+    # Run validation first
+    print()
+    print("── Validation ──")
+    validation = run_validation(wf)
+    print(validation)
     print()
 
+    if validation.has_errors():
+        print("❌ Validation failed — aborting. Use `hermes workflow check` for details.")
+        return 1
+
+    # ── Dry-run: show graph + plan, but don't execute ──
+    if args.dry_run:
+        print("── Dry Run (no cards created, no execution) ──")
+        graph = WorkflowGraph(wf)
+        gs = graph.summary()
+        print(f"  Nodes: {gs['node_count']}")
+        print(f"  Dependency edges: {gs['dependency_edges']}")
+        print(f"  Control-flow edges: {gs['control_flow_edges']}")
+        print(f"  Sink nodes (terminals): {gs['sink_nodes']}")
+        print()
+        print("── Planned Steps ──")
+        for step in wf.steps:
+            _print_planned_step(step, indent=2)
+        print()
+        print("✅ Dry-run complete — no errors.")
+        return 0
+
+    # ── Full run ──
+    print()
     try:
         pipeline_id, cards = compile_workflow(
             wf=wf,
@@ -205,7 +280,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
     print(f"\nPipeline: {pipeline_id}")
     print(f"Cards created: {len(cards)}\n")
 
-    # Run
     rc = run_pipeline(
         wf=wf,
         pipeline_id=pipeline_id,
@@ -214,6 +288,95 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
 
     return rc
+
+
+def _cmd_check(args: argparse.Namespace) -> int:
+    """Validate a workflow YAML — comprehensive logical analysis."""
+    wf, source = _load_workflow(args)
+    if wf is None:
+        return 1
+
+    print(f"Workflow: {wf.meta.name} v{wf.meta.version}")
+    print(f"Steps: {len(wf.steps)}")
+    if wf.meta.description:
+        print(f"Description: {wf.meta.description}")
+    print()
+
+    # ── 1. Validation rules ──
+    val = run_validation(wf)
+    print(val)
+    print()
+
+    # ── 2. Graph analysis ──
+    graph = WorkflowGraph(wf)
+    gs = graph.summary()
+
+    print(f"── Graph Analysis ──")
+    print(f"  Nodes: {gs['node_count']}")
+    print(f"  Control-flow edges: {gs['control_flow_edges']}")
+    print(f"  Dependency edges: {gs['dependency_edges']}")
+    print()
+
+    # Dependency cycles
+    if gs["dep_cycles"]:
+        print(f"  ❌ Dependency cycles ({len(gs['dep_cycles'])}):")
+        for c in gs["dep_cycles"]:
+            print(f"     {' → '.join(c)}")
+        print()
+    else:
+        print(f"  ✅ No dependency cycles")
+        print()
+
+    # Control-flow cycles
+    if gs["cf_cycles"]:
+        print(f"  ⚠️  Control-flow cycles ({len(gs['cf_cycles'])}):")
+        for c in gs["cf_cycles"]:
+            print(f"     {' → '.join(c)}")
+        print()
+    else:
+        print(f"  ✅ No control-flow cycles")
+        print()
+
+    # Orphans
+    if gs["orphan_nodes"]:
+        print(f"  ❌ Unreachable steps ({len(gs['orphan_nodes'])}):")
+        for o in gs["orphan_nodes"]:
+            print(f"     '{o}' — no path from the entry step")
+        print()
+    else:
+        print(f"  ✅ All steps reachable from entry point")
+        print()
+
+    # Dead loops
+    if gs["dead_loops"]:
+        print(f"  ❌ Dead loops (no exit path, {len(gs['dead_loops'])}):")
+        for l in gs["dead_loops"]:
+            print(f"     '{l}'")
+        print()
+    else:
+        print(f"  ✅ No dead loops")
+        print()
+
+    # Sinks
+    print(f"  ℹ️  Terminal steps: {gs['sink_nodes']}")
+    print()
+
+    # ── 3. Step-by-step walkthrough ──
+    print("── Step Walkthrough ──")
+    for i, step in enumerate(wf.steps):
+        _print_step_walkthrough(step, i, wf)
+    print()
+
+    # ── 4. Summary verdict ──
+    if gs["has_issues"] or val.has_errors():
+        print("❌ FAIL — Issues found that may prevent execution.")
+        return 1
+    elif val.has_warnings():
+        print("⚠️  PASS with warnings — review recommendations above.")
+        return 0
+    else:
+        print("✅ PASS — Workflow looks good.")
+        return 0
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
@@ -300,11 +463,27 @@ def _cmd_template_show(args: argparse.Namespace) -> int:
     print()
     for step in wf.steps:
         print(f"  - id: {step.id}")
-        print(f"    type: {step.type.value}")
+        print(f"    type: step.type.value")
         if step.depends_on:
             print(f"    depends_on: {step.depends_on}")
         print()
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _parse_vars(var_list: list) -> dict:
+    """Parse --var key=val arguments into a dict."""
+    result = {}
+    for v in var_list:
+        if "=" not in v:
+            print(f"Warning: ignoring --var without '=': {v}", file=sys.stderr)
+            continue
+        key, _, val = v.partition("=")
+        result[key.strip()] = val.strip()
+    return result
 
 
 def _fmt_age(ts: int) -> str:
@@ -319,4 +498,60 @@ def _fmt_age(ts: int) -> str:
         return f"{seconds // 86400}d"
 
 
-import time  # noqa: E402 — used by _fmt_age
+def _print_planned_step(step, indent: int = 2) -> None:
+    """Print a planned step in the dry-run plan view."""
+    prefix = " " * indent
+    from .workflow.schema import ScriptStep, KanbanStep, LoopStep, NoopStep, StepType
+
+    if isinstance(step, ScriptStep):
+        print(f"{prefix}📜 {step.id}: script — {step.script[:80]}...")
+    elif isinstance(step, KanbanStep):
+        title = step.template.title
+        assignee = step.template.assignee
+        skill = step.template.skill or "(default)"
+        for_each = f" [for_each: {step.for_each}]" if step.for_each else ""
+        print(f"{prefix}📋 {step.id}: kanban → {assignee} ({skill}){for_each}")
+        print(f"{prefix}   title: {title}")
+    elif isinstance(step, LoopStep):
+        cond = f" while: {step.while_condition}" if step.while_condition else ""
+        print(f"{prefix}🔄 {step.id}: loop (max={step.max_iterations}{cond})")
+        for sub in step.steps:
+            _print_planned_step(sub, indent + 4)
+    elif isinstance(step, NoopStep):
+        summary = f" — {step.summary}" if step.summary else ""
+        print(f"{prefix}⏹️  {step.id}: noop{summary}")
+
+
+def _print_step_walkthrough(step, index: int, wf) -> None:
+    """Print step info in the check command walkthrough."""
+    from .workflow.schema import ScriptStep, KanbanStep, LoopStep, NoopStep
+
+    deps = f", depends_on: {step.depends_on}" if step.depends_on else ""
+    if isinstance(step, ScriptStep):
+        nxt = _next_step_text(step.id, wf)
+        gotos = ""
+        if step.on_exit:
+            branches = "; ".join(f"exit {k} → {b.goto}" for k, b in step.on_exit.items())
+            gotos = f" [{branches}]"
+        print(f"  [{index}] 📜 {step.id}: script{deps}{gotos} → {nxt}")
+    elif isinstance(step, KanbanStep):
+        print(f"  [{index}] 📋 {step.id}: kanban → {step.template.assignee}{deps}")
+    elif isinstance(step, LoopStep):
+        sub_ids = [s.id for s in step.steps]
+        cond = f" while: \"{step.while_condition}\"" if step.while_condition else ""
+        print(f"  [{index}] 🔄 {step.id}: loop(max={step.max_iterations}{cond}) "
+              f"→ sub-steps: {sub_ids}")
+    elif isinstance(step, NoopStep):
+        print(f"  [{index}] ⏹️  {step.id}: noop{deps}")
+
+
+def _next_step_text(step_id: str, wf) -> str:
+    """Return text describing what follows a step in the default flow."""
+    ids = [s.id for s in wf.steps]
+    try:
+        idx = ids.index(step_id)
+        if idx + 1 < len(ids):
+            return f"→ {ids[idx + 1]}"
+        return "→ (end)"
+    except ValueError:
+        return "(not in top-level flow)"
