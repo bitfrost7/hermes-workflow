@@ -136,7 +136,7 @@ def _process_step(
         _process_kanban(
             step, pipeline_id, resolved_vars,
             created_card_map, all_cards, wf.meta.name, board,
-            log_id, verbose,
+            log_id=log_id, verbose=verbose, step_outputs=step_outputs,
         )
 
     elif isinstance(step, LoopStep):
@@ -212,12 +212,19 @@ def _process_kanban(
     board: Optional[str],
     log_id: int,
     verbose: bool = False,
+    step_outputs: Optional[dict] = None,
 ) -> None:
     """Create kanban cards for a kanban step (with optional for_each fan-out)."""
 
+    # Merge step_outputs into vars for template resolution.
+    # This allows {{ task_data.tasks }} from a prior script step's output.
+    render_vars = {**vars}
+    if step_outputs:
+        render_vars.update(step_outputs)
+
     # Resolve iteration items
     if step.for_each:
-        items = _eval_jinja_expr(step.for_each, vars)
+        items = _eval_jinja_expr(step.for_each, render_vars)
         if not isinstance(items, list):
             items = [items]
     else:
@@ -226,7 +233,7 @@ def _process_kanban(
     created_card_ids: list[str] = []
 
     for item in items:
-        item_vars = {**vars, "item": item}
+        item_vars = {**render_vars, "item": item}
         title = _render_str(step.template.title, item_vars)
         assignee = _render_str(step.template.assignee, item_vars)
         skill = _render_str(step.template.skill, item_vars) if step.template.skill else None
