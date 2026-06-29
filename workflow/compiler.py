@@ -415,6 +415,8 @@ def _render_str(template: str, vars: dict) -> str:
             val = _eval_jinja_expr(expr, vars)
             if val is None:
                 return ""
+            if isinstance(val, (dict, list)):
+                return json.dumps(val, ensure_ascii=False)
             return str(val)
         except Exception:
             return m.group(0)
