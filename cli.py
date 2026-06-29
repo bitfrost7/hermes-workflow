@@ -106,14 +106,14 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     p_tmpl.add_argument("name", help="Template name")
 
     # version
-    parser.set_defaults(func=_dispatch)
+    parser.set_defaults(func=dispatch)
 
 
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
-def _dispatch(args: argparse.Namespace) -> int:
+def dispatch(args: argparse.Namespace) -> int:
     cmd = getattr(args, "workflow_cmd", None)
     if cmd is None:
         print("Usage: hermes workflow <command> [options]")

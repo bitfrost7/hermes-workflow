@@ -18,6 +18,22 @@ Usage:
 
 from __future__ import annotations
 
-from .cli import register_cli
+from . import cli as _cli
 
-__all__ = ["register_cli"]
+
+def register(ctx) -> None:
+    """Plugin entry point — called by Hermes plugin manager with a PluginContext.
+
+    Registers the ``hermes workflow ...`` CLI subcommand tree.
+    """
+    ctx.register_cli_command(
+        name="workflow",
+        help="Run, manage, and inspect YAML-defined kanban workflow pipelines",
+        description=(
+            "Compile YAML workflow definitions into Hermes Kanban task cards "
+            "with parent-child dependency chains. Supports URL/file/template "
+            "sources, review-fix loops, and automatic step advancement."
+        ),
+        setup_fn=_cli.register_cli,
+        handler_fn=_cli.dispatch,
+    )
