@@ -50,7 +50,7 @@ class WorkflowGraph:
         """Build the graph from the WorkflowDef."""
         step_map = {s.id: s for s in self._all_steps(self.wf)}
 
-        # Control-flow edges (sequential + goto)
+        # Control-flow edges (sequential + goto + loop internals)
         ordered = self.wf.steps
         for i, step in enumerate(ordered):
             # Sequential: step[i] → step[i+1] (unless overridden by goto)
@@ -61,6 +61,18 @@ class WorkflowGraph:
             if isinstance(step, ScriptStep) and step.on_exit:
                 for exit_code, branch in step.on_exit.items():
                     self.cf_edges[step.id].add(branch.goto)
+
+            # Loop internals: parent → first sub-step, sub-step chain,
+            # and last sub-step → parent (for iteration back to top)
+            if isinstance(step, LoopStep) and step.steps:
+                first_sub = step.steps[0].id
+                self.cf_edges[step.id].add(first_sub)
+                for j, sub in enumerate(step.steps):
+                    if j + 1 < len(step.steps):
+                        self.cf_edges[sub.id].add(step.steps[j + 1].id)
+                # Last sub-step loops back to parent
+                last_sub = step.steps[-1].id
+                self.cf_edges[last_sub].add(step.id)
 
         # Dependency edges
         for step in self._all_steps(self.wf):
