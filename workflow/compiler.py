@@ -225,17 +225,6 @@ def _process_kanban(
     if step_outputs:
         render_vars.update(step_outputs)
 
-    # Debug: check if step_outputs are present
-    if verbose:
-        has_task = "task_data" in render_vars
-        show_vars = {k: str(v)[:60] for k, v in render_vars.items()}
-        print(f"     render_vars keys: {list(render_vars.keys())}")
-        print(f"     has task_data={has_task}")
-        if has_task:
-            td = render_vars["task_data"]
-            tasks = td.get("tasks", []) if isinstance(td, dict) else []
-            print(f"     task_data.tasks = {len(tasks)} task(s)")
-
     # Resolve iteration items
     if step.for_each:
         # Strip {{ }} wrapper if present (stored from YAML with braces)
@@ -245,10 +234,6 @@ def _process_kanban(
         items = _eval_jinja_expr(expr, render_vars)
         if not isinstance(items, list):
             items = [items]
-        if verbose:
-            print(f"     for_each='{step.for_each}' → {type(items).__name__}[{len(items)}]")
-            if items and isinstance(items[0], dict):
-                print(f"     first item keys: {list(items[0].keys())}")
     else:
         items = [None]
 
