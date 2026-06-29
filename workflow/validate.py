@@ -192,10 +192,17 @@ def check_cf_cycles(graph: WorkflowGraph, result: ValidationResult) -> None:
     """
     cycles = graph.find_cf_cycles()
     for cycle in cycles:
-        # Skip if the entire cycle is inside a loop (expected)
-        is_sub_loop = all(graph.loop_parent.get(n) for n in cycle)
-        if is_sub_loop:
-            continue
+        # Skip if the cycle is internal to a LoopStep:
+        # all nodes are either the loop parent or children of it
+        loop_owners = {graph.loop_parent.get(n) for n in cycle}
+        if len(loop_owners) == 1 and None not in loop_owners:
+            continue  # All children of one loop — expected
+        if len(loop_owners) == 2 and None in loop_owners:
+            # One node IS the loop parent, rest are its children
+            parent_id = next(n for n in loop_owners if n is not None)
+            children = {n for n in cycle if graph.loop_parent.get(n) == parent_id}
+            if children and any(n == parent_id for n in cycle):
+                continue  # Loop parent + its children — expected
         result.add(ValidationIssue(
             ValidationIssue.SEVERITY_ERROR,
             "cf-cycle",
