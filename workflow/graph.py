@@ -255,14 +255,27 @@ class WorkflowGraph:
         orphans = self.find_orphans()
         dead_loops = self.find_dead_loops()
 
+        # Filter cf_cycles: skip loops that are internal to a LoopStep
+        unexpected_cf = []
+        for cycle in cf_cycles:
+            loop_owners = {self.loop_parent.get(n) for n in cycle}
+            if len(loop_owners) == 1 and None not in loop_owners:
+                continue  # All children of one loop — expected
+            if len(loop_owners) == 2 and None in loop_owners:
+                parent_id = next(n for n in loop_owners if n is not None)
+                children = {n for n in cycle if self.loop_parent.get(n) == parent_id}
+                if children and any(n == parent_id for n in cycle):
+                    continue  # Loop parent + its children — expected
+            unexpected_cf.append(cycle)
+
         return {
             "node_count": len(self.step_ids),
             "dependency_edges": sum(len(v) for v in self.dep_edges.values()),
             "control_flow_edges": sum(len(v) for v in self.cf_edges.values()),
             "dep_cycles": [list(c) for c in dep_cycles],
-            "cf_cycles": [list(c) for c in cf_cycles],
+            "cf_cycles": [list(c) for c in unexpected_cf],
             "orphan_nodes": orphans,
             "dead_loops": dead_loops,
             "sink_nodes": self.find_sinks(),
-            "has_issues": bool(dep_cycles or cf_cycles or orphans or dead_loops),
+            "has_issues": bool(dep_cycles or unexpected_cf or orphans or dead_loops),
         }
