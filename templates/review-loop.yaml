@@ -1,0 +1,97 @@
+# review-loop.yaml — Built-in review-fix pipeline template
+#
+# A Writer → Reviewer → Fix → Re-review cycle pipeline.
+# Used when you need documented artifacts reviewed by a separate profile
+# and potentially revised through multiple cycles.
+#
+# Usage:
+#   hermes workflow run --template review-loop --var service=apisvr
+
+meta:
+  name: review-loop
+  version: 1.0.0
+  description: "Writer → Reviewer → Fix → Re-review pipeline with up to 10 fix cycles"
+
+vars:
+  VAULT: "{{ .VAULT }}"
+  SERVICE: "{{ .service }}"
+
+steps:
+
+  # ── Step 1: Writer creates documents ──
+  - id: writer
+    type: kanban
+    template:
+      title: "writer: {{ SERVICE }} interfaces"
+      assignee: writer
+      skill: interface-sk
+      workspace: "dir:{{ VAULT }}"
+      body: |
+        service={{ SERVICE }}
+        output_dir={{ VAULT }}/Wiki/privatelink/{{ SERVICE }}
+        source_dir={{ VAULT }}/raw/assets/repo/privatelink/{{ SERVICE }}
+
+  # ── Step 2: Reviewer reviews ──
+  - id: reviewer
+    type: kanban
+    depends_on: [writer]
+    template:
+      title: "review: {{ SERVICE }} interfaces"
+      assignee: reviewer
+      skill: review-sk
+      workspace: "dir:{{ VAULT }}"
+      body: |
+        doc_file=interfaces/{{ SERVICE }}.md
+        discuss_path={{ VAULT }}/raw/assets/privatelink/{{ SERVICE }}/discuss
+
+  # ── Step 3: Verify discuss ──
+  - id: verify
+    type: script
+    depends_on: [reviewer]
+    script: "{{ VAULT }}/bin/discuss verify {{ VAULT }}/raw/assets/privatelink/{{ SERVICE }}/discuss"
+    on_exit:
+      0:
+        goto: done
+      else:
+        goto: fix_loop
+
+  # ── Fix loop ──
+  - id: fix_loop
+    type: loop
+    max_iterations: 10
+    while: "steps.verify.exit_code != 0"
+    steps:
+      - id: fix
+        type: kanban
+        template:
+          title: "fix: {{ SERVICE }}"
+          assignee: writer
+          skill: fix-sk
+          workspace: "dir:{{ VAULT }}"
+          body: |
+            discuss_path={{ VAULT }}/raw/assets/privatelink/{{ SERVICE }}/discuss
+
+      - id: re_review
+        type: kanban
+        depends_on: [fix]
+        template:
+          title: "re-review: {{ SERVICE }}"
+          assignee: reviewer
+          skill: review-sk
+          workspace: "dir:{{ VAULT }}"
+          body: |
+            doc_file=interfaces/{{ SERVICE }}.md
+            discuss_path={{ VAULT }}/raw/assets/privatelink/{{ SERVICE }}/discuss
+
+      - id: check_again
+        type: script
+        depends_on: [re_review]
+        script: "{{ VAULT }}/bin/discuss verify {{ VAULT }}/raw/assets/privatelink/{{ SERVICE }}/discuss"
+        on_exit:
+          0:
+            goto: done
+
+  # ── Done ──
+  - id: done
+    type: noop
+    summary: "Pipeline complete for {{ SERVICE }}"

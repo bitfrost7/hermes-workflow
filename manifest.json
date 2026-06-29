@@ -1,0 +1,14 @@
+{
+  "name": "workflow",
+  "version": "0.1.0",
+  "description": "YAML-defined kanban workflow pipelines with review-fix loops, step advancement, and URL/local file sources.",
+  "author": "bitfrost7",
+  "license": "MIT",
+  "homepage": "https://github.com/bitfrost7/hermes-workflow",
+  "entry": "__init__.py",
+  "tags": ["kanban", "workflow", "pipeline", "orchestration", "automation"],
+  "hermes": {
+    "min_version": "3.0.0",
+    "plugin_type": "functionality"
+  }
+}
